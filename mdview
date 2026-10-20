@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+# mdview: render markdown to an image (pandoc + headless chromium) and show it
+# in the terminal with sixel graphics. Re-renders automatically when the file changes.
+#
+#   mdview file.md
+#
+# Keys: j/k, ↑/↓ or wheel scroll, h/l or ←/→ pan wide pages, d/u half page, space/b page,
+#       g/G top/bottom, r reload, q quit
+# Env:  MDVIEW_SYNC  if set, the source line at the top of the view is written to this file
+#                    (vim follows it to scroll the editor along with the preview)
+#       MDVIEW_CELL  size of one terminal cell in sixel pixels, WxH (default 10x20,
+#                    Windows Terminal maps sixel images onto a 10x20 virtual cell)
+
+set -u
+file=$(realpath "$1") || exit 1
+share=$HOME/.local/share/mdview
+# headless chrome: $MDVIEW_CHROME, else playwright's headless shell, else one on PATH
+chrome=${MDVIEW_CHROME:-$(ls -d "$HOME"/.cache/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell 2>/dev/null | sort -V | tail -1)}
+if [[ -z $chrome ]]; then
+  for c in chrome-headless-shell chromium chromium-browser google-chrome; do
+    command -v "$c" >/dev/null && { chrome=$(command -v "$c"); break; }
+  done
+fi
+[[ -n $chrome ]] || { echo "mdview: no headless chrome found (set MDVIEW_CHROME)" >&2; exit 1; }
+cell=${MDVIEW_CELL:-10x20}
+cell_w=${cell%x*} cell_h=${cell#*x}
+tmp=$(mktemp -d)
+tty_state=$(stty -g </dev/tty)
+trap 'stop_spinner; unhook; rm -rf "$tmp"; printf "\e[?1006l\e[?1000l\e[?1049l\e[?25h"; stty "$tty_state" </dev/tty' EXIT
+# alternate screen + mouse reporting, so the wheel reaches us instead of tmux copy-mode;
+# echo stays off the whole time so mouse events arriving mid-draw aren't printed
+stty -echo -icanon </dev/tty
+printf '\e[?1049h\e[?1000h\e[?1006h'
+bg='#0d1117'
+if [[ -n ${TMUX:-} ]]; then
+  # tmux drops sixel images itself, so they are sent straight to the terminal
+  tmux set -p -t "$TMUX_PANE" allow-passthrough on 2>/dev/null
+  # tmux repaints the pane from its text grid (losing the image) when it comes back on
+  # screen: window switch, zoom toggle, session switch. Have tmux signal us right away;
+  # the hook slot is derived from the pane id so several previews don't clash.
+  hook_slot=$((9000 + ${TMUX_PANE#%}))
+  repaint_hooks=(session-window-changed window-layout-changed client-session-changed client-attached)
+  for h in "${repaint_hooks[@]}"; do
+    tmux set-hook -g "$h[$hook_slot]" "run-shell -b 'kill -USR1 $$ 2>/dev/null || true'"
+  done
+fi
+unhook() {
+  [[ -n ${hook_slot:-} ]] || return
+  local h
+  for h in "${repaint_hooks[@]}"; do tmux set-hook -gu "$h[$hook_slot]" 2>/dev/null; done
+}
+
+# print the sixel file $1 at the top-left of this pane
+show_sixel() {
+  if [[ -z ${TMUX:-} ]]; then
+    printf '\e[H'; cat "$1"
+    return
+  fi
+  # passthrough output lands wherever the real cursor is, so move it to the
+  # pane's absolute position first (tmux forgets its cursor after passthrough)
+  local top left
+  read -r top left < <(tmux display -p -t "$TMUX_PANE" \
+    '#{e|+:#{pane_top},#{?#{==:#{status-position},top},#{?status,1,0},0}} #{pane_left}')
+  printf '\ePtmux;'
+  { printf '\e7\e[%d;%dH' $((top + 1)) $((left + 1))
+    cat "$1"
+    printf '\e8'; } | sed 's/\x1b/\x1b\x1b/g'
+  printf '\e\\'
+}
+
+# loading animation while chrome works: centered when the pane is blank, otherwise in
+# the status line so the previous image stays visible
+spinner_pid=
+start_spinner() {
+  local blank=$1
+  (
+    sleep 0.15  # quick redraws don't need an animation
+    frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏) i=0 size=
+    while true; do
+      read -r r c < <(stty size </dev/tty); f=${frames[i++ % 10]}
+      # after a resize the old frames sit at stale positions (and tmux wiped the image)
+      if [[ $size != "$r $c" ]]; then
+        [[ -n $size ]] && blank=1
+        ((blank)) && printf '\e[H\e[2J'
+        size="$r $c"
+      fi
+      if ((blank)); then
+        printf '\e[%d;%dH\e[38;5;75m%s\e[0m rendering…' $((r / 2)) $((c / 2 > 6 ? c / 2 - 6 : 1)) "$f"
+      fi
+      status=" $f $(basename "$file")  rendering… "
+      printf '\e[%d;1H\e[7m%s\e[0m\e[K' "$r" "${status:0:c}"
+      sleep 0.08
+    done
+  ) &
+  spinner_pid=$!
+}
+stop_spinner() {
+  [[ -n $spinner_pid ]] || return
+  kill "$spinner_pid" 2>/dev/null; wait "$spinner_pid" 2>/dev/null
+  spinner_pid=
+}
+
+# The page is screenshotted lazily in chunks of chunk_h css px (2x device scale), so long
+# files stay fast. Each chunk is scaled to the pane width once and encoded to sixel once,
+# split into 6px bands; scrolling then only picks the visible bands, no re-encoding.
+chunk_h=4000
+# chrome_run WIDTH ARGS...
+chrome_run() {
+  local w=$1; shift
+  "$chrome" --headless --no-sandbox --disable-gpu --hide-scrollbars \
+    --default-background-color=0d1117ff --force-device-scale-factor=2 \
+    --window-size="$w,$chunk_h" "$@" 2>/dev/null
+}
+
+render() {
+  {
+    printf '<!doctype html><html><head><meta charset="utf-8"><base href="file://%s/"><style>' "$(dirname "$file")"
+    cat "$share/style.css"
+    printf 'body{width:%dpx}/*SHIFT*/' "$page_w"
+    printf '</style></head><body>'
+    pandoc -f gfm+sourcepos -t html5 --highlight-style=pygments \
+      --lua-filter "$share/plantuml.lua" "$file" 2>/dev/null
+    # after load: report the document size in the title, and a "top:line,..." map of where
+    # each source line's block ends up (from pandoc's data-pos) for scroll sync
+    cat <<'EOF'
+<script>addEventListener("load", () => {
+  const e = document.documentElement, m = [];
+  // body height, not scrollHeight: that is never less than the 4000px tall window
+  document.title = "H" + Math.ceil(document.body.getBoundingClientRect().height) + "W" + e.scrollWidth;
+  for (const n of document.querySelectorAll("[data-pos]")) {
+    if (n.tagName == "SPAN") continue;
+    const l = [...n.dataset.pos.matchAll(/(?:^|[@;])(\d+):/g)].map(x => +x[1]);
+    if (l.length) m.push(Math.round(n.getBoundingClientRect().top + scrollY) + ":" + Math.min(...l));
+  }
+  e.dataset.map = m.join(",");
+})</script>
+EOF
+    printf '</body></html>'
+  } > "$tmp/page.html"
+  rm -f "$tmp"/chunk-* "$tmp"/d-*
+  local h w
+  chrome_run "$page_w" --dump-dom "file://$tmp/page.html" > "$tmp/dom.html"
+  read -r h w < <(grep -om1 '<title>H[0-9]*W[0-9]*' "$tmp/dom.html" | tr -c '0-9' ' ')
+  grep -om1 'data-map="[^"]*"' "$tmp/dom.html" | tr -dc '0-9:,' | tr ',:' '\n ' |
+    sort -n -k1,1 -k2,2 > "$tmp/map.txt"
+  synced_line=
+  img_h=$(( ${h:-$chunk_h} * 2 ))
+  # wide content (long code lines, big tables) makes the document wider than the page
+  doc_w=$(( ${w:-0} > page_w ? w : page_w ))
+  n_chunks=$(( (img_h + chunk_h * 2 - 1) / (chunk_h * 2) ))
+  mtime=$(stat -c %Y "$file")
+  rendered_w=$page_w
+}
+
+# chunk $1 is ready to display at the current pane width
+have_chunk() { [[ -f $tmp/d-$px_w-$1.bands ]]; }
+
+make_chunk() {
+  local raw=$tmp/chunk-$1.png d=$tmp/d-$px_w-$1
+  have_chunk "$1" && return
+  if [[ ! -f $raw ]]; then
+    sed "s|/\*SHIFT\*/|body{transform:translateY(-$(( $1 * chunk_h ))px)}|" "$tmp/page.html" > "$tmp/chunk.html"
+    chrome_run "$doc_w" --screenshot="$raw" "file://$tmp/chunk.html" >/dev/null
+  fi
+  magick "$raw" -resize "${chunk_dw}x${chunk_dh}!" "$d.png"
+  img2sixel "$d.png" | python3 -I "$share/bands.py" > "$d.bands.tmp" && mv "$d.bands.tmp" "$d.bands"
+}
+
+draw() {
+  read -r rows cols < <(stty size </dev/tty)
+  view_rows=$((rows - 2))
+  # pane size in sixel pixels (height in whole 6px bands); the page is laid out to the
+  # pane width so text keeps its size
+  px_w=$((cols * cell_w)) px_h=$((view_rows * cell_h / 6 * 6))
+  page_w=$(( px_w * 64 / 100 < 360 ? 360 : px_w * 64 / 100 ))
+
+  local busy=0
+  [[ $page_w != "${rendered_w:-}" ]] && busy=1
+  ((busy)) && { ((shown)) || printf '\e[?25l\e[H\e[2J'; start_spinner $((!shown)); render; }
+
+  # display-space geometry: a chunk is chunk_dh px tall (a whole number of bands) and
+  # chunk_dw px wide (wider than the pane only when the document is wider than the page)
+  chunk_dh=$(( (chunk_h * px_w / page_w + 3) / 6 * 6 ))
+  chunk_dw=$(( doc_w * px_w / page_w ))
+  max_xoff=$(( chunk_dw - px_w ))
+  ((xoff > max_xoff)) && xoff=$max_xoff
+  ((xoff < 0)) && xoff=0
+  local bands_per_chunk=$((chunk_dh / 6))
+  disp_h=$(( img_h * chunk_dh / (chunk_h * 2) ))
+  max_off=$(( disp_h > px_h ? (disp_h - px_h) / 6 * 6 : 0 ))
+  ((off > max_off)) && off=$max_off
+  ((off < 0)) && off=0
+  off=$((off / 6 * 6))
+
+  local b0=$((off / 6)) b1 k0 k1 k
+  b1=$((b0 + px_h / 6 - 1))
+  k0=$((b0 / bands_per_chunk)) k1=$((b1 / bands_per_chunk))
+  ((k1 >= n_chunks)) && k1=$((n_chunks - 1))
+  for ((k = k0; k <= k1; k++)); do
+    if ! have_chunk $k; then
+      ((busy)) || { busy=1; ((shown)) || printf '\e[?25l\e[H\e[2J'; start_spinner $((!shown)); }
+      make_chunk $k
+    fi
+  done
+  stop_spinner
+
+  local d=$tmp/d-$px_w-$k0
+  if ((k0 == k1 && chunk_dw == px_w)); then
+    # fast path: slice the pre-encoded bands of one chunk
+    { sed -n 1p "$d.bands" | tr -d '\n'
+      printf '"1;1;%d;%d' "$px_w" "$px_h"
+      sed -n 2p "$d.bands" | tr -d '\n'
+      sed -n "$((b0 % bands_per_chunk + 3)),$((b1 % bands_per_chunk + 3))p" "$d.bands" | paste -sd-
+      printf '\e\\'; } > "$tmp/view.six"
+  else
+    # the view straddles two chunks (each has its own palette) or is panned sideways:
+    # encode just this view
+    local parts=("$d.png"); ((k1 != k0)) && parts+=("$tmp/d-$px_w-$k1.png")
+    magick "${parts[@]}" -append \
+      -crop "${px_w}x${px_h}+${xoff}+$(( (b0 % bands_per_chunk) * 6 ))" +repage "$tmp/view.png"
+    img2sixel "$tmp/view.png" > "$tmp/view.six"
+  fi
+
+  if ((!shown)); then
+    printf '\e[?25l\e[H\e[2J'
+    sleep 0.15  # let tmux paint the cleared pane before the image arrives
+  fi
+  show_sixel "$tmp/view.six"
+  shown=1
+  sync_editor
+  draw_status
+}
+
+draw_status() {
+  local pct pan= status
+  pct=$(( max_off ? off * 100 / max_off : 100 ))
+  ((max_xoff > 0)) && pan="  ←→ $(( xoff * 100 / max_xoff ))%"
+  status=" $(basename "$file")  $pct%$pan  [j/k h/l d/u space/b g/G r q] "
+  printf '\e[%d;1H\e[K\e[%d;1H\e[7m%s\e[0m\e[K' $((rows - 1)) "$rows" "${status:0:cols}"
+}
+
+# put the last image back after tmux repainted the pane (window switch, unzoom): nothing
+# changed, so skip the clear/re-encode and resend the cached sixel right away
+repaint_view() {
+  local r c
+  read -r r c < <(stty size </dev/tty)
+  # a different size needs a real redraw
+  if [[ ! -f $tmp/view.six || $r != "$rows" || $c != "$cols" ]]; then
+    shown=0; draw; return
+  fi
+  show_sixel "$tmp/view.six"
+  draw_status
+}
+
+# tell the editor which source line is at the top of the view
+sync_editor() {
+  [[ -n ${MDVIEW_SYNC:-} && -s $tmp/map.txt ]] || return
+  local line
+  line=$(awk -v y=$(( off * page_w / px_w + 8 )) '$1 <= y { l = $2 } $1 > y { exit } END { print l + 0 }' "$tmp/map.txt")
+  ((line > 0)) || line=1
+  [[ $line == "$synced_line" ]] && return
+  synced_line=$line
+  echo "$line" > "$MDVIEW_SYNC"
+}
+
+# is this pane on screen? (its window is the current one of an attached session, and
+# another pane isn't zoomed over it)
+pane_visible() {
+  [[ -z ${TMUX:-} ]] && return 0
+  local active attached zoomed pane_active
+  read -r active attached zoomed pane_active < <(tmux display -p -t "$TMUX_PANE" \
+    '#{window_active} #{session_attached} #{window_zoomed_flag} #{pane_active}' 2>/dev/null)
+  ((active && attached && (!zoomed || pane_active)))
+}
+
+# while idle, prepare the chunks just above and below the view
+prefetch() {
+  local bpc=$((chunk_dh / 6)) k
+  for k in $(( (off / 6 + px_h / 6) / bpc + 1 )) $(( off / 6 / bpc - 1 )); do
+    ((k >= 0 && k < n_chunks)) || continue
+    have_chunk $k || { make_chunk $k; return 0; }
+  done
+  return 1
+}
+
+# read one key; escape sequences (arrows, SGR mouse) come back as a single token
+read_key() {
+  local c seq=
+  IFS= read -rsn1 -t "$1" c || return 1
+  if [[ $c == $'\e' ]]; then
+    while IFS= read -rsn1 -t 0.01 c; do
+      seq+=$c
+      [[ $c == [A-Za-z~] && $seq != '[' ]] && break
+    done
+    case $seq in
+      '[A') key=k ;;
+      '[B') key=j ;;
+      '[C') key=l ;;
+      '[D') key=h ;;
+      '[5~') key=b ;;
+      '[6~') key=' ' ;;
+      '[<64;'*M) key=wheel_up ;;
+      '[<65;'*M) key=wheel_down ;;
+      *) key= ;;
+    esac
+  else
+    key=$c
+  fi
+}
+
+off=0 xoff=0 shown=0 resized=0 visible=1 repaint=0
+# a resize wipes the image; redraw from the main loop rather than inside the trap. Set
+# before the first draw so a resize during the initial render isn't lost.
+trap 'resized=1' WINCH
+trap 'repaint=1' USR1
+draw
+while true; do
+  if read_key 0.3; then
+    step=$((px_h / 12)) page=$((px_h * 9 / 10))
+    moved=0
+    # handle this key plus anything already queued (fast wheel spins) with a single redraw
+    while true; do
+      case $key in
+        j|wheel_down) off=$((off + step)) ;;
+        k|wheel_up) off=$((off - step)) ;;
+        h) xoff=$((xoff - px_w / 4)) ;;
+        l) xoff=$((xoff + px_w / 4)) ;;
+        d) off=$((off + px_h / 2)) ;;
+        u) off=$((off - px_h / 2)) ;;
+        ' '|f) off=$((off + page)) ;;
+        b) off=$((off - page)) ;;
+        g) off=0 ;;
+        G) off=$disp_h ;;
+        r) rendered_w= ;;
+        q) exit 0 ;;
+      esac
+      [[ -n $key ]] && moved=1
+      read_key 0.02 || break
+    done
+    ((moved)) && draw
+  elif ((resized)); then
+    resized=0 shown=0
+    draw
+  elif [[ -f $file && $(stat -c %Y "$file") != "$mtime" ]]; then
+    rendered_w=
+    draw
+  elif ! pane_visible; then
+    visible=0 repaint=0
+  elif ((!visible || repaint)); then
+    # back from another tmux window: tmux repaints the pane from its own text grid, which
+    # has no idea about the image, so draw it again
+    visible=1 repaint=0
+    repaint_view
+  else
+    prefetch
+  fi
+done
